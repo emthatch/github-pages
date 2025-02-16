@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Naloxone Distribution Simulation for Opioid Overdoses in CA</title>
+<link href="https://fonts.googleapis.com/css2?family=Proxima+Nova:wght@400;700&display=swap" rel="stylesheet">
+<style>
+body {
+    font-family: 'Proxima Nova', sans-serif;
+    background-color: #022851;
+    color: #FFBF00;
+    padding: 20px;
+    font-size: 14px;
+}
+.input-group { margin: 15px 0; }
+input, select {
+    padding: 8px;
+    margin: 5px;
+    background-color: #03396c;
+    color: #FFBF00;
+    border: 1px solid #FFBF00;
+    font-size: 14px;
+}
+button {
+    background-color: #005b96;
+    color: #FFBF00;
+    padding: 10px 20px;
+    border: none;
+    cursor: pointer;
+    font-size: 14px;
+}
+table {
+    width: 60%;
+    border-collapse: collapse;
+    margin-top: 20px;
+    font-size: 18px;
+}
+th, td {
+    border: 1px solid #FFBF00;
+    padding: 8px;
+    text-align: left;
+    background-color: white;
+    color: #000000;
+}
+#map {
+    height: 300px;
+    width: 60%;
+    margin: 20px 0;
+    border: 1px solid #FFBF00;
+}
+.pac-container {
+    font-family: 'Proxima Nova', sans-serif;
+    font-size: 14px;
+}
+</style>
+</head>
+<body>
+<h1>Naloxone Distribution Simulation for Opioid Overdoses in Rural CA</h1>
+
+<div class="input-group">
+<label>Start Address:</label>
+<input type="text" id="startAddress" placeholder="Starting address (street, city, county)">
+</div>
+
+<div class="input-group">
+<label>Destination Address:</label>
+<input type="text" id="destAddress" placeholder="Destination address (street, city, county)">
+</div>
+
+<div class="input-group">
+<label>Weather Conditions:</label>
+<input type="number" id="temp" placeholder="Temperature (°C)" min="-20" max="60" required>
+<input type="number" id="wind" placeholder="Wind Speed (MPH)" min="0" max="100" required>
+<select id="precip" required>
+<option value="0">No Precipitation</option>
+<option value="1">Precipitation</option>
+</select>
+</div>
+
+<button onclick="runSimulation()">Simulate Delivery</button>
+
+<div id="map"></div>
+
+<table id="resultsTable">
+<tr>
+<th>Metric</th>
+<th>Drone Delivery</th>
+<th>EMS Delivery</th>
+</tr>
+</table>
+
+<script>
+const API_KEY = 'AIzaSyAy9s3Vid5CBZZn5WZcKqMj-DoQMDj378U';
+const BASE_DRONE_SPEED = 27.8; // m/s (~100 km/h)
+const EMS_AVG_SPEED = 16.7; // m/s (~60 km/h)
+let map, startMarker, destMarker, startAutocomplete, destAutocomplete, dronePolyline, emsPolyline;
+
+function initMap() {
+    try {
+        map = new google.maps.Map(document.getElementById('map'), {
+            center: {lat: 36.7783, lng: -119.4179},
+            zoom: 6,
+            streetViewControl: false,
+            mapTypeControlOptions: {
+                style: google.maps.MapTypeControlStyle.DROPDOWN_MENU
+            }
+        });
+
+        startAutocomplete = new google.maps.places.Autocomplete(
+            document.getElementById('startAddress'), {
+                componentRestrictions: { country: 'us' },
+                fields: ['geometry', 'formatted_address']
+            });
+
+        destAutocomplete = new google.maps.places.Autocomplete(
+            document.getElementById('destAddress'), {
+                componentRestrictions: { country: 'us' },
+                fields: ['geometry', 'formatted_address']
+            });
+
+        startAutocomplete.addListener('place_changed', () => {
+            const place = startAutocomplete.getPlace();
+            if (place.geometry) {
+                if (startMarker) startMarker.setMap(null);
+                startMarker = new google.maps.Marker({
+                    map: map,
+                    position: place.geometry.location,
+                    title: "Start Location"
+                });
+                map.panTo(place.geometry.location);
+            }
+        });
+
+        destAutocomplete.addListener('place_changed', () => {
+            const place = destAutocomplete.getPlace();
+            if (place.geometry) {
+                if (destMarker) destMarker.setMap(null);
+                destMarker = new google.maps.Marker({
+                    map: map,
+                    position: place.geometry.location,
+                    title: "Destination",
+                    icon: {
+                        url: "http://maps.google.com/mapfiles/ms/icons/blue-dot.png"
+                    }
+                });
+                map.panTo(place.geometry.location);
+            }
+        });
+
+    } catch (error) {
+        console.error("Map initialization error:", error);
+        alert("Error initializing map components");
+    }
+}
+
+function drawRoutes(startLoc, destLoc, drivingPath) {
+    // Clear existing polylines if they exist
+    if (dronePolyline) dronePolyline.setMap(null);
+    if (emsPolyline) emsPolyline.setMap(null);
+
+    // Draw drone route (straight line)
+    dronePolyline = new google.maps.Polyline({
+        path: [
+            { lat: startLoc.lat(), lng: startLoc.lng() },
+            { lat: destLoc.lat(), lng: destLoc.lng() }
+        ],
+        geodesic: true,
+        strokeColor: "#FF0000",
+        strokeOpacity: 1.0,
+        strokeWeight: 2
+    });
+
+    // Draw EMS route (following roads)
+    emsPolyline = new google.maps.Polyline({
+        path: drivingPath,
+        strokeColor: "#0000FF",
+        strokeOpacity: 1.0,
+        strokeWeight: 2
+    });
+
+    // Set both polylines on the map
+    dronePolyline.setMap(map);
+    emsPolyline.setMap(map);
+}
+
+async function runSimulation() {
+    const startPlace = startAutocomplete.getPlace();
+    const destPlace = destAutocomplete.getPlace();
+
+    if (!startPlace?.geometry || !destPlace?.geometry) {
+        alert('Please select valid addresses from the suggestions');
+        return;
+    }
+
+    try {
+        const temp = parseFloat(document.getElementById('temp').value);
+        const wind = parseFloat(document.getElementById('wind').value);
+        const precip = document.getElementById('precip').value;
+
+        if (isNaN(temp) || isNaN(wind)) {
+            alert('Please enter valid weather values');
+            return;
+        }
+
+        const startLoc = startPlace.geometry.location;
+        const destLoc = destPlace.geometry.location;
+
+        const crowDistance = calculateHaversine(startLoc, destLoc);
+        const driveResult = await calculateDrivingDistance(startPlace, destPlace);
+        const weatherImpact = calculateWeatherImpact(temp, wind, precip);
+
+        const droneTime = calculateDroneTime(crowDistance, weatherImpact);
+        const emsTime = calculateEMSTime(driveResult.distance);
+
+        // Draw both routes
+        drawRoutes(startLoc, destLoc, driveResult.path);
+
+        // Update the results table
+        updateResultsTable(crowDistance, driveResult.distance, droneTime, emsTime, temp, wind, precip);
+
+    } catch (error) {
+        console.error('Simulation error:', error);
+        alert('Error processing request. Please check inputs and try again.');
+    }
+}
+
+function calculateHaversine(point1, point2) {
+    const R = 6371e3; // Earth radius in meters
+    const φ1 = point1.lat() * Math.PI/180;
+    const φ2 = point2.lat() * Math.PI/180;
+    const Δφ = (point2.lat() - point1.lat()) * Math.PI/180;
+    const Δλ = (point2.lng() - point1.lng()) * Math.PI/180;
+
+    const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+              Math.cos(φ1) * Math.cos(φ2) *
+              Math.sin(Δλ/2) * Math.sin(Δλ/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c;
+}
+
+function calculateDrivingDistance(originPlace, destPlace) {
+    return new Promise((resolve, reject) => {
+        const directionsService = new google.maps.DirectionsService();
+        directionsService.route({
+            origin: originPlace.formatted_address,
+            destination: destPlace.formatted_address,
+            travelMode: 'DRIVING'
+        }, (response, status) => {
+            if (status === 'OK' && response.routes[0]) {
+                const path = response.routes[0].overview_path;
+                resolve({
+                    distance: response.routes[0].legs[0].distance.value,
+                    path: path
+                });
+            } else {
+                reject('Could not calculate driving distance');
+            }
+        });
+    });
+}
+
+function calculateWeatherImpact(temp, wind, precip) {
+    let impact = 1;
+    if (wind > 13.4) impact *= 0.85; // >30 mph (13.4 m/s)
+    if (precip == 1) impact *= 0.75;
+    if (temp < 0 || temp > 35) impact *= 0.9;
+    return Math.max(impact, 0.5);
+}
+
+function calculateDroneTime(distance, weatherImpact) {
+    const effectiveSpeed = BASE_DRONE_SPEED * weatherImpact;
+    return (distance / effectiveSpeed) / 60; // Convert seconds to minutes
+}
+
+function calculateEMSTime(distance) {
+    return (distance / EMS_AVG_SPEED) / 60; // Convert seconds to minutes
+}
+
+function updateResultsTable(crowDistance, driveDistance, droneTime, emsTime, temp, wind, precip) {
+    const table = document.getElementById('resultsTable');
+    table.innerHTML = `
+    <tr>
+        <th>Metric</th>
+        <th>Drone Delivery</th>
+        <th>EMS Delivery</th>
+    </tr>
+    <tr>
+        <td>Distance</td>
+        <td>${(crowDistance/1609.34).toFixed(2)} kilometers</td>
+        <td>${(driveDistance/1609.34).toFixed(2)} kilometers</td>
+    </tr>
+    <tr>
+        <td>Estimated Time</td>
+        <td>${droneTime.toFixed(1)} minutes</td>
+        <td>${emsTime.toFixed(1)} minutes</td>
+    </tr>
+    <tr>
+        <td>Weather Impact</td>
+        <td colspan="2">${precip == 1 ? 'Precipitation' : 'Clear'} | 
+        ${wind} mph wind | 
+        ${temp}°C</td>
+    </tr>
+    `;
+}
+</script>
+<script async defer src="https://maps.googleapis.com/maps/api/js?key=AIzaSyAy9s3Vid5CBZZn5WZcKqMj-DoQMDj378U&callback=initMap&libraries=places">
+</script>
+</body>
+</html>
